@@ -1,4 +1,4 @@
-#### This fork focuses on batch processing and improved GPU utilization. However, models are called separately with data modifications being applied inbetween.
+#### This fork focuses on batch processing and improved GPU utilization. However, models are called separately from external code with data modification applied inbetween.
 
 # Py-FEAT: Python Facial Expression Analysis Toolbox
 [![arXiv-badge](https://img.shields.io/badge/arXiv-2104.03509-red.svg)](https://arxiv.org/abs/2104.03509) 
