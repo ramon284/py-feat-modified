@@ -33,6 +33,7 @@ from feat.data import (
     _inverse_face_transform,
     _inverse_landmark_transform,
 )
+from feat.transforms import Rescale
 import torch
 from torch.utils.data import DataLoader
 from torchvision.transforms import Compose, Normalize, Grayscale, ToTensor
@@ -56,6 +57,7 @@ class Detector(object):
         device="cpu",
         n_jobs=1,
         verbose=False,
+        landmark_cuda=False,
         **kwargs,
     ):
         """Detector class to detect FEX from images or videos.
@@ -112,6 +114,7 @@ class Detector(object):
 
         # Setup device
         self.device = set_torch_device(device)
+        self.landmark_cuda = landmark_cuda
 
         # Verify model names and download if necessary
         face, landmark, au, emotion, facepose = get_pretrained_models(
@@ -228,6 +231,8 @@ class Detector(object):
                         map_location=self.device,
                     )
                     self.landmark_detector.load_state_dict(checkpoint["state_dict"])
+            if self.landmark_cuda:
+                self.landmark_detector = self.landmark_detector.cuda()
             self.landmark_detector.eval()
 
             self.info["landmark_model"] = landmark
@@ -471,6 +476,95 @@ class Detector(object):
                 list_concat.append(landmark_results[new_lens[ij] : new_lens[ij + 1]])
 
         return list_concat
+    
+    def extract_face_from_bbox_batch(self, frames, detected_faces_batch, face_size=112, expand_bbox=1.2):
+        length_index = [len(ama) for ama in detected_faces_batch]
+        length_cumu = np.cumsum(length_index)
+
+        flat_faces = [
+            item for sublist in detected_faces_batch for item in sublist
+        ]  # Flatten the faces
+
+        bbox_list = []
+        cropped_faces = []
+        for k, face in enumerate(flat_faces):
+            frame_assignment = np.where(k < length_cumu)[0][0]  # which frame is it?
+            im_height, im_width = frames[frame_assignment].shape[-2:]
+
+            bbox = BBox(
+                face[:-1], bottom_boundary=im_height, right_boundary=im_width
+            ).expand_by_factor(expand_bbox)
+            cropped = bbox.extract_from_image(frames[frame_assignment])
+            transform = Compose(
+                [Rescale(output_size=face_size, preserve_aspect_ratio=True, padding=True)]
+            )
+            cropped_faces.append(transform(cropped))
+            bbox_list.append(bbox)
+
+        faces = torch.cat(
+            tuple([convert_image_to_tensor(x["Image"]) for x in cropped_faces]), 0
+        )
+
+        return faces, bbox_list
+    
+    def detect_landmarks_batch(self, frames, detected_faces_batch, **landmark_model_kwargs):
+        logging.info("detecting landmarks batches...")
+        
+        frames = [convert_image_to_tensor(frame) for frame in frames]
+        
+        frames = torch.cat(frames, dim=0)
+        if torch.cuda.is_available():
+            frames = frames.cuda()
+
+        if is_list_of_lists_empty(detected_faces_batch):
+            return detected_faces_batch
+
+        if self.info["landmark_model"]:
+            if self.info["landmark_model"].lower() == "mobilenet":
+                out_size = 224
+            else:
+                out_size = 112
+
+        ##print(f'frames = {frames}\n detected_faces_batch = {detected_faces_batch}\nface_size = {out_size}')
+        extracted_faces_batch, new_bbox_batch = self.extract_face_from_bbox_batch(
+            frames, detected_faces_batch, face_size=out_size
+        )
+
+        extracted_faces_batch = extracted_faces_batch / 255.0
+
+        if self.info["landmark_model"].lower() == "mobilenet":
+            extracted_faces_batch = Compose(
+                [Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
+            )(extracted_faces_batch)
+
+        if self.info["landmark_model"].lower() == "mobilefacenet":
+            landmarks_batch = (
+                self.landmark_detector(extracted_faces_batch, **landmark_model_kwargs)[0]
+                .cpu()
+                .data.numpy()
+            )
+        else:
+            landmarks_batch = (
+                self.landmark_detector(extracted_faces_batch, **landmark_model_kwargs)
+                .cpu()
+                .data.numpy()
+            )
+
+        landmarks_batch = landmarks_batch.reshape(landmarks_batch.shape[0], -1, 2)
+
+        landmark_results = []
+        for ik in range(landmarks_batch.shape[0]):
+            landmark_results.append(
+                new_bbox_batch[ik].inverse_transform_landmark(landmarks_batch[ik, :, :])
+            )
+
+        length_index = [len(x) for x in detected_faces_batch]
+        new_lens = np.insert(np.cumsum(length_index), 0, 0)
+        list_concat = []
+        for ij in range(len(length_index)):
+            list_concat.append(landmark_results[new_lens[ij]: new_lens[ij + 1]])
+
+        return list_concat
 
     def detect_facepose(self, frame, landmarks=None, **facepose_model_kwargs):
         """Detect facepose from image or video frame.
@@ -546,6 +640,27 @@ class Detector(object):
                 )
 
             return self._convert_detector_output(landmarks, au_predictions)
+        
+    
+    def detect_aus_batch_cpu(self, frames, landmarks, **au_model_kwargs):
+        logging.info("detecting aus...")
+        frames = [convert_image_to_tensor(frame) for frame in frames]
+
+        frames = torch.cat(frames, dim=0)
+
+        if self["au_model"].lower() in ["svm", "xgb"]:
+
+            hog_features, new_landmarks = self._batch_hog(frames=frames, landmarks=landmarks)
+
+            au_predictions = self.au_model.detect_au(
+                frame=hog_features, landmarks=new_landmarks, **au_model_kwargs
+            )
+        else:
+            au_predictions = self.au_model.detect_au(
+                frames, landmarks=landmarks, **au_model_kwargs
+            )
+
+        return self._convert_detector_output(landmarks, au_predictions)
 
     def _batch_hog(self, frames, landmarks):
         """

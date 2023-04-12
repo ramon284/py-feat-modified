@@ -111,7 +111,7 @@ class Img2Pose:
         elif optimizer:
             print("Optimizer not found in model path - cannot be loaded")
 
-    def __call__(self, img_):
+    def __call__(self, img_, batch=False):
         """Runs scale_and_predict on each image in the passed image list
 
         Args:
@@ -121,6 +121,9 @@ class Img2Pose:
             tuple: (faces, poses) - 3D lists (B, F, bbox) or (B, F, face pose) where B is batch/ image number and
                                     F is face number
         """
+        if batch:
+            preds = self.scale_and_predict_batch(img_)
+            return preds["boxes"], preds["poses"]
 
         # Notes: vectorized version runs, but only returns results from a single image. Switching back to list version for now.
         # preds = self.scale_and_predict(img_)
@@ -234,6 +237,121 @@ class Img2Pose:
             det_pose.append(list(dof_pose.flatten()))
 
         return {"boxes": det_bboxes, "poses": det_pose}
+    
+    
+    
+    def scale_and_predict_batch(self, img_batch, euler=True):
+        """Runs a prediction on the passed batch of images. Returns detected faces and associated poses.
+        Args:
+            img_batch (List[np.ndarray]): A list of images in the batch
+            euler (bool): set to True to obtain euler angles, False to obtain rotation vector
+
+        Returns:
+            dict: key 'pose' contains array - [yaw, pitch, roll], key 'boxes' contains 2D array of bboxes
+        """
+
+        scaled_images = []
+        scales = []
+        border_sizes = []
+
+        for img in img_batch:
+            scale = 1
+            border_size = 0
+            if min(img.shape[-2:]) < self.MIN_SIZE or max(img.shape[-2:]) > self.MAX_SIZE:
+                logging.info(
+                    f"img2pose: RESCALING WARNING: img2pose has a min img size of {self.MIN_SIZE} and a max img size of {self.MAX_SIZE} but checked value is {img.shape[-2:]}."
+                )
+                transform = Compose([Rescale(self.MAX_SIZE, preserve_aspect_ratio=True)])
+                transformed_img = transform(img)
+                img = transformed_img["Image"]
+                scale = transformed_img["Scale"]
+
+            scaled_images.append(img)
+            scales.append(scale)
+            border_sizes.append(border_size)
+
+        preds = self.predict_batch(scaled_images, border_sizes=border_sizes, scales=scales, euler=euler)
+
+        return preds
+    
+    
+    def predict_batch(self, img_batch, border_sizes=None, scales=None, euler=True):
+        """Runs the img2pose model on the passed batch of images and returns bboxes and face poses.
+
+        Args:
+            img_batch (List[np.ndarray]): A list of images in the batch
+            border_sizes (List[int]): if the cv2 images have a border, the width of the border (in pixels)
+            scales (List[float]): if the images were resized, the scale factors used to perform resizing
+            euler (bool): set to True to obtain euler angles, False to obtain rotation vector
+
+        Returns:
+            dict: A dictionary of bboxes and poses
+
+        """
+
+        if border_sizes is None:
+            border_sizes = [0] * len(img_batch)
+
+        if scales is None:
+            scales = [1.0] * len(img_batch)
+
+        # Obtain predictions
+        pred_batch = self.model.predict(img_batch)
+
+        all_boxes = []
+        all_poses = []
+
+        for img_idx, pred in enumerate(pred_batch):
+            boxes = pred["boxes"].cpu().numpy().astype("float")
+            scores = pred["scores"].cpu().numpy().astype("float")
+            dofs = pred["dofs"].cpu().numpy().astype("float")
+
+            # Obtain boxes sorted by score
+            inds = np.where(scores > self.nms_inclusion_threshold)[0]
+            boxes, scores, dofs = boxes[inds], scores[inds], dofs[inds]
+            order = scores.argsort()[::-1][: self.top_k]
+            boxes, scores, dofs = boxes[order], scores[order], dofs[order]
+
+            # Perform NMS
+            dets = np.hstack((boxes, scores[:, np.newaxis])).astype(np.float32, copy=False)
+            keep = py_cpu_nms(dets, self.nms_threshold)
+
+            # Prepare predictions
+            det_bboxes = []
+            det_dofs = []
+            for i in keep:
+                bbox = dets[i]
+
+                # Remove added image borders
+                bbox[0] = max(bbox[0] - border_sizes[img_idx], 0) // scales[img_idx]
+                bbox[1] = max(bbox[1] - border_sizes[img_idx], 0) // scales[img_idx]
+                bbox[2] = (bbox[2] - border_sizes[img_idx]) // scales[img_idx]
+                bbox[3] = (bbox[3] - border_sizes[img_idx]) // scales[img_idx]
+
+                # Keep bboxes with sufficiently high scores
+                score = bbox[4]
+                if score > self.detection_threshold:
+                    det_bboxes.append(list(bbox))
+                    det_dofs.append(dofs[i])
+
+            # Obtain pitch, roll, yaw estimates
+            det_pose = []
+            for pose_pred in det_dofs:
+                if euler:  # Convert rotation vector into euler angles
+                    pose_pred[:3] = convert_to_euler(pose_pred[:3])
+
+                if self.RETURN_DIM == 3:
+                    dof_pose = pose_pred[:3]  # pitch, roll, yaw (when euler=True)
+                else:
+                    dof_pose = pose_pred[:]  # pitch, roll, yaw, x, y, z
+
+                dof_pose = dof_pose.reshape(1, -1)
+                det_pose.append(list(dof_pose.flatten()))
+
+            all_boxes.append(det_bboxes)
+            all_poses.append(det_pose)
+
+        return {"boxes": all_boxes, "poses": all_poses}
 
     def set_threshold(self, threshold):
         """Alter the threshold for face detection.
